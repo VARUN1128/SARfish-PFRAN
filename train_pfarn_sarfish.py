@@ -23,10 +23,17 @@ import os
 import sys
 import argparse
 from PIL import Image
+Image.MAX_IMAGE_PIXELS = None  # Disable decompression bomb limit for large SAR images
 import numpy as np
 from tqdm import tqdm
 import json
 from pathlib import Path
+try:
+    import rasterio
+    from rasterio.windows import Window
+    HAS_RASTERIO = True
+except ImportError:
+    HAS_RASTERIO = False
 
 # Import PFARN modules
 from pfarn_modules import SSConv, PFA, CACHead
@@ -102,8 +109,45 @@ class SARShipDataset(Dataset):
         
         # Load image
         img_path = self.root_dir / img_info['file_name']
-        img = Image.open(img_path).convert('RGB')
-        img = np.array(img)
+        
+        # Use rasterio for large TIFF files, PIL for others
+        if img_path.suffix.lower() in ['.tif', '.tiff'] and HAS_RASTERIO:
+            try:
+                with rasterio.open(img_path) as src:
+                    # Read all bands and convert to RGB
+                    if src.count >= 3:
+                        img = np.dstack([src.read(i+1) for i in range(3)])
+                    else:
+                        # Single band, replicate for RGB
+                        band = src.read(1)
+                        img = np.dstack([band, band, band])
+                    # Normalize to 0-255 range if needed
+                    if img.dtype != np.uint8:
+                        img = (img / img.max() * 255).astype(np.uint8)
+            except:
+                # Fallback to PIL
+                img = Image.open(img_path).convert('RGB')
+                img = np.array(img)
+        else:
+            img = Image.open(img_path).convert('RGB')
+            img = np.array(img)
+        
+        # Resize large images to manageable size (max 2048x2048)
+        # This is necessary for training as full-size SAR images are too large
+        original_height, original_width = img.shape[:2]
+        max_size = 2048
+        if original_width > max_size or original_height > max_size:
+            scale = min(max_size / original_width, max_size / original_height)
+            new_width = int(original_width * scale)
+            new_height = int(original_height * scale)
+            img = Image.fromarray(img).resize((new_width, new_height), Image.Resampling.LANCZOS)
+            img = np.array(img)
+            # Update image info for annotation scaling
+            width_scale = new_width / original_width
+            height_scale = new_height / original_height
+        else:
+            width_scale = 1.0
+            height_scale = 1.0
         
         # Get annotations
         boxes = []
@@ -114,6 +158,11 @@ class SARShipDataset(Dataset):
                 # COCO format: [x, y, width, height] -> [x1, y1, x2, y2]
                 bbox = ann['bbox']
                 x, y, w, h = bbox
+                # Scale bounding boxes if image was resized
+                x = x * width_scale
+                y = y * height_scale
+                w = w * width_scale
+                h = h * height_scale
                 boxes.append([x, y, x + w, y + h])
                 labels.append(ann['category_id'])
         
@@ -311,11 +360,19 @@ def main():
     )
     
     # Split dataset (80% train, 20% val)
-    train_size = int(0.8 * len(full_dataset))
-    val_size = len(full_dataset) - train_size
-    train_dataset, val_dataset = torch.utils.data.random_split(
-        full_dataset, [train_size, val_size]
-    )
+    # For small datasets, use all data for training and validation
+    if len(full_dataset) <= 2:
+        # If 1-2 images, use all for training, create empty val set
+        train_size = len(full_dataset)
+        val_size = 0
+        train_dataset = full_dataset
+        val_dataset = torch.utils.data.Subset(full_dataset, [])  # Empty subset
+    else:
+        train_size = int(0.8 * len(full_dataset))
+        val_size = len(full_dataset) - train_size
+        train_dataset, val_dataset = torch.utils.data.random_split(
+            full_dataset, [train_size, val_size]
+        )
     
     # Create data loaders
     train_loader = DataLoader(
@@ -326,13 +383,16 @@ def main():
         collate_fn=collate_fn
     )
     
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=4,
-        collate_fn=collate_fn
-    )
+    # Only create val_loader if we have validation data
+    val_loader = None
+    if val_size > 0:
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=4,
+            collate_fn=collate_fn
+        )
     
     print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
     
@@ -384,8 +444,12 @@ def main():
         print(f"  - RPN Box Reg: {train_losses['loss_rpn_box_reg']:.4f}")
         
         # Validate
-        val_loss = evaluate(model, val_loader, device)
-        print(f"Val Loss: {val_loss:.4f}")
+        if val_loader is not None:
+            val_loss = evaluate(model, val_loader, device)
+            print(f"Val Loss: {val_loss:.4f}")
+        else:
+            val_loss = float('inf')  # No validation data, use train loss for best model
+            print(f"Val Loss: N/A (no validation data)")
         
         # Update learning rate
         lr_scheduler.step()
@@ -402,12 +466,20 @@ def main():
             }, checkpoint_path)
             print(f"Saved checkpoint: {checkpoint_path}")
         
-        # Save best model
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            model_path = os.path.join(args.output_dir, 'model.bin')
-            torch.save(model.state_dict(), model_path)
-            print(f"Saved best model: {model_path} (val_loss: {val_loss:.4f})")
+        # Save best model (use train loss if no validation)
+        if val_loader is not None:
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                model_path = os.path.join(args.output_dir, 'model.bin')
+                torch.save(model.state_dict(), model_path)
+                print(f"Saved best model: {model_path}")
+        else:
+            # No validation, save model based on train loss
+            if train_losses['total'] < best_val_loss:
+                best_val_loss = train_losses['total']
+                model_path = os.path.join(args.output_dir, 'model.bin')
+                torch.save(model.state_dict(), model_path)
+                print(f"Saved best model (based on train loss): {model_path}")
     
     print(f"\n{'='*60}")
     print("Training completed!")

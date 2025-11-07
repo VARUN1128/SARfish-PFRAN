@@ -274,19 +274,47 @@ def find_image_pixel_lat_lon_coord(image_filenames, output_filename):
 #   detections_lat_lon = pixel_bb_to_coord_bb(coord_list, image_path)
 #   return detections_lat_lon
 
-def pixel_bb_to_coord_bb(xy_coord_list, image_path):
+def pixel_bb_to_coord_bb(xy_coord_list, tiff_path, shard_path):
+  """
+  Convert pixel bounding boxes from shard coordinates to lat/lon coordinates.
+  
+  Args:
+    xy_coord_list: List of bounding boxes in shard pixel coordinates
+    tiff_path: Path to original GeoTIFF file (for georeferencing)
+    shard_path: Path to shard image (to calculate offset)
+  """
   detection_list = []
+  
+  # Extract shard number from filename to calculate offset
+  # Format: shard_XX.png or shard_XXX.png
+  import re
+  shard_match = re.search(r'shard_(\d+)', shard_path)
+  if shard_match:
+    shard_num = int(shard_match.group(1))
+    # Calculate shard position (assuming 800x800 shards)
+    shard_size = 800
+    with rasterio.open(tiff_path) as src:
+      width = src.width
+      cols_per_row = (width + shard_size - 1) // shard_size  # Ceiling division
+      shard_row = shard_num // cols_per_row
+      shard_col = shard_num % cols_per_row
+      offset_x = shard_col * shard_size
+      offset_y = shard_row * shard_size
+  else:
+    # Fallback: assume no offset
+    offset_x = 0
+    offset_y = 0
+  
   for xy_bb in xy_coord_list:
-    # print(xy_bb)
-    x1 = xy_bb[0]
-    y1 = xy_bb[1]
-    x2 = xy_bb[2]
-    y2 = xy_bb[3]
-    xy_cords = (x1,x2,y1,y2)
-    centerx, centery = ( numpy.average(xy_cords[:2]),numpy.average(xy_cords[2:]))
-    # print(centerx, centery)
-    lat_lon_detection = pixel2coord(image_path, centerx, centery)
-    # print(lat_lon_detection)
+    # Convert shard coordinates to original image coordinates
+    x1 = xy_bb[0] + offset_x
+    y1 = xy_bb[1] + offset_y
+    x2 = xy_bb[2] + offset_x
+    y2 = xy_bb[3] + offset_y
+    xy_cords = (x1, x2, y1, y2)
+    centerx, centery = (numpy.average(xy_cords[:2]), numpy.average(xy_cords[2:]))
+    # Use original TIFF path for coordinate conversion
+    lat_lon_detection = pixel2coord(tiff_path, centerx, centery)
     detection_list.append(lat_lon_detection)
   return detection_list
 
@@ -329,24 +357,36 @@ def get_geojson_detections(tiff_path, shard_dir, outpath):
   	print("Splitting image into shards")
   	print(shard_dir)
   	splitImageIntoCells(src, "shard", 800, shard_dir)
-  shard_list = glob.glob(shard_dir+"*.png")
+  shard_list = sorted(glob.glob(shard_dir+"*.png"))  # Sort for consistent ordering
   list_of_ship_detections = []
   confidence_list = []
   print("Finding ships")
   for image_fp in tqdm(shard_list):
-    im = Image.open(image_fp).convert('RGB')
-    jpg_path = image_fp[:-4]+".jpg"
-    # print(jpg_path)
-    # im.mode = 'I'
-    # im.point(lambda i:i*(1./256)).convert('L').save(jpg_path)
-    im.save(jpg_path)
-    confidence_and_coords = get_new_image_detection_coords_and_prediction_confidence(jpg_path, detection_threshold)
-    coords_list = []
-    for tuple_value in confidence_and_coords:
-    	coords_list.append(tuple_value[1])
-    	confidence_list.append(tuple_value[0])
-    detections_lat_lon = pixel_bb_to_coord_bb(coords_list, image_fp)
-    list_of_ship_detections.append(detections_lat_lon)
+    try:
+      # Check if file exists
+      if not os.path.exists(image_fp):
+        print(f"Warning: Shard file not found: {image_fp}, skipping...")
+        list_of_ship_detections.append([])  # Add empty list to maintain indexing
+        continue
+      
+      im = Image.open(image_fp).convert('RGB')
+      jpg_path = image_fp[:-4]+".jpg"
+      # print(jpg_path)
+      # im.mode = 'I'
+      # im.point(lambda i:i*(1./256)).convert('L').save(jpg_path)
+      im.save(jpg_path)
+      confidence_and_coords = get_new_image_detection_coords_and_prediction_confidence(jpg_path, detection_threshold)
+      coords_list = []
+      for tuple_value in confidence_and_coords:
+      	coords_list.append(tuple_value[1])
+      	confidence_list.append(tuple_value[0])
+      # Pass original TIFF path and shard path to calculate offset
+      detections_lat_lon = pixel_bb_to_coord_bb(coords_list, tiff_path, image_fp)
+      list_of_ship_detections.append(detections_lat_lon)
+    except Exception as e:
+      print(f"Error processing shard {image_fp}: {e}, skipping...")
+      list_of_ship_detections.append([])  # Add empty list to maintain indexing
+      continue
   df = pd.DataFrame(columns = ["lat","lon"])
   i = 0
   flat_list = [item for sublist in list_of_ship_detections for item in sublist]
@@ -381,43 +421,44 @@ def get_geojson_detections(tiff_path, shard_dir, outpath):
   gdf["detection_confidence"] = confidence_list
   gdf.to_file(outpath, driver='GeoJSON')
 
-tiff_filename = sys.argv[1]
-output_geojson_filename = sys.argv[2]
-detection_threshold = float(sys.argv[3])
+if __name__ == "__main__":
+  tiff_filename = sys.argv[1]
+  output_geojson_filename = sys.argv[2]
+  detection_threshold = float(sys.argv[3])
 
-rootdir = os.getcwd()
-shard_dir = rootdir+"/shards/"
-tiff_filepath = rootdir+"/"+tiff_filename
-output_geojson_filepath = rootdir+"/" + output_geojson_filename
+  rootdir = os.getcwd()
+  shard_dir = rootdir+"/shards/"
+  tiff_filepath = rootdir+"/"+tiff_filename
+  output_geojson_filepath = rootdir+"/" + output_geojson_filename
 
-# Validate input file exists
-if not os.path.exists(tiff_filepath):
-    print(f"\nERROR: Input file not found: {tiff_filepath}")
-    print(f"\nPlease provide a valid SAR GeoTIFF image file.")
-    print(f"Current working directory: {rootdir}")
-    print(f"\nExample usage:")
-    print(f"  python SARfish.py path/to/your_image.tif output.geojson 0.5")
-    print(f"\nIf your file is in a different location, use the full path:")
-    print(f"  python SARfish.py C:\\path\\to\\your_image.tif output.geojson 0.5")
-    sys.exit(1)
+  # Validate input file exists
+  if not os.path.exists(tiff_filepath):
+      print(f"\nERROR: Input file not found: {tiff_filepath}")
+      print(f"\nPlease provide a valid SAR GeoTIFF image file.")
+      print(f"Current working directory: {rootdir}")
+      print(f"\nExample usage:")
+      print(f"  python SARfish.py path/to/your_image.tif output.geojson 0.5")
+      print(f"\nIf your file is in a different location, use the full path:")
+      print(f"  python SARfish.py C:\\path\\to\\your_image.tif output.geojson 0.5")
+      sys.exit(1)
 
 
-os.makedirs(shard_dir, exist_ok=True)
+  os.makedirs(shard_dir, exist_ok=True)
 
-num_classes = 2
-model_ft = get_pfarn_sarfish_model(num_classes)
+  num_classes = 2
+  model_ft = get_pfarn_sarfish_model(num_classes)
 
-# Try to load pretrained weights if available
-model_bin_path = rootdir + "/" + "model.bin"
-if os.path.exists(model_bin_path):
-    print(f"Loading pretrained model from {model_bin_path}")
-    model_ft.load_state_dict(torch.load(model_bin_path, map_location=torch.device('cpu')))
-else:
-    print(f"Warning: model.bin not found at {model_bin_path}")
-    print("Running with untrained model weights (detections may be inaccurate)")
-    print("To use trained weights, place model.bin in the SARfish directory")
+  # Try to load pretrained weights if available
+  model_bin_path = rootdir + "/" + "model.bin"
+  if os.path.exists(model_bin_path):
+      print(f"Loading pretrained model from {model_bin_path}")
+      model_ft.load_state_dict(torch.load(model_bin_path, map_location=torch.device('cpu')))
+  else:
+      print(f"Warning: model.bin not found at {model_bin_path}")
+      print("Running with untrained model weights (detections may be inaccurate)")
+      print("To use trained weights, place model.bin in the SARfish directory")
 
-model_ft.eval()
+  model_ft.eval()
 
-get_geojson_detections(tiff_filepath, shard_dir, output_geojson_filepath)
-shutil.rmtree(shard_dir)
+  get_geojson_detections(tiff_filepath, shard_dir, output_geojson_filepath)
+  shutil.rmtree(shard_dir)

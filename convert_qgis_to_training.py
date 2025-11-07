@@ -51,7 +51,8 @@ def find_tif_files(tif_dir: Path) -> Dict[str, Path]:
     tif_files = {}
     
     # Look for .001.tif files first (as mentioned in workflow)
-    patterns = ['*.001.tif', '*.001.TIF', '*.tif', '*.TIF']
+    # Also include .tiff files (double 'f' extension)
+    patterns = ['*.001.tif', '*.001.TIF', '*.001.tiff', '*.001.TIFF', '*.tif', '*.TIF', '*.tiff', '*.TIFF']
     
     for pattern in patterns:
         for tif_file in tif_dir.rglob(pattern):
@@ -216,6 +217,8 @@ def convert_shp_to_coco(
         
         try:
             # Read shapefile
+            # Enable SHX restoration if missing (set before reading)
+            os.environ['SHAPE_RESTORE_SHX'] = 'YES'
             gdf = gpd.read_file(shp_path)
             print(f"  Found {len(gdf)} features")
             
@@ -225,14 +228,28 @@ def convert_shp_to_coco(
             
             # Try different matching strategies
             matched_tif = None
-            for key, tif_path in tif_files.items():
-                # Remove common suffixes/prefixes
-                key_clean = key.replace('_', '').replace('-', '').lower()
-                shp_clean = shp_stem.replace('_', '').replace('-', '').lower()
-                
-                if key_clean in shp_clean or shp_clean in key_clean:
-                    matched_tif = tif_path
-                    break
+            
+            # Strategy 1: Extract date from filenames and match
+            import re
+            shp_date_match = re.search(r'(\d{8})', shp_stem)
+            if shp_date_match:
+                shp_date = shp_date_match.group(1)
+                for key, tif_path in tif_files.items():
+                    tif_date_match = re.search(r'(\d{8})', key)
+                    if tif_date_match and tif_date_match.group(1) == shp_date:
+                        matched_tif = tif_path
+                        break
+            
+            # Strategy 2: Try substring matching
+            if matched_tif is None:
+                for key, tif_path in tif_files.items():
+                    # Remove common suffixes/prefixes
+                    key_clean = key.replace('_', '').replace('-', '').lower()
+                    shp_clean = shp_stem.replace('_', '').replace('-', '').lower()
+                    
+                    if key_clean in shp_clean or shp_clean in key_clean:
+                        matched_tif = tif_path
+                        break
             
             # If no match, try first available or ask user
             if matched_tif is None:
@@ -240,7 +257,7 @@ def convert_shp_to_coco(
                     matched_tif = list(tif_files.values())[0]
                     print(f"  Using single available TIFF: {matched_tif.name}")
                 else:
-                    print(f"  ⚠️  Warning: Could not match {shp_path.name} with TIFF file")
+                    print(f"  WARNING: Could not match {shp_path.name} with TIFF file")
                     print(f"     Available TIFF files: {list(tif_files.keys())[:5]}...")
                     print(f"     Skipping this shapefile")
                     continue
@@ -297,11 +314,11 @@ def convert_shp_to_coco(
                 annotation_id += 1
                 valid_annotations += 1
             
-            print(f"  ✓ Created {valid_annotations} annotations for image {image_id}")
+            print(f"  OK Created {valid_annotations} annotations for image {image_id}")
             image_id += 1
             
         except Exception as e:
-            print(f"  ✗ Error processing {shp_path.name}: {e}")
+            print(f"  ERROR processing {shp_path.name}: {e}")
             import traceback
             traceback.print_exc()
             continue

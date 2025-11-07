@@ -98,3 +98,9 @@ dir model.bin
 
 **Try it now!** This will answer your question: "How is it gonna work?" - by showing you the complete pipeline works!
 
+
+
+
+
+
+
